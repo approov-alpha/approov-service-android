@@ -1,0 +1,352 @@
+// OkHttp 4 compatibility check (applied from approov-service/build.gradle).
+//
+// The library compiles against okhttpVersion, an OkHttp 5 release, but a React Native app declares it
+// with the com.squareup.okhttp3 group excluded and runs it on React Native's OkHttp 4. A call to anything
+// that OkHttp 5 added compiles and then fails only in such an app, with NoSuchMethodError or
+// NoClassDefFoundError. verifyOkHttp4Compatibility reads the classes of the release AAR, lists every
+// okhttp3 class and member they refer to, and fails when one is missing from okhttpMinimumVersion
+// (gradle.properties) or would not link against it: a static member that is no longer static, an
+// interface that is a class there (or the reverse), a member that is not public or protected, an
+// abstract method a library class does not implement, or a final method a library class overrides. The
+// list is written to build/reports/okhttp-compatibility/okhttp-<version>.txt.
+
+// ASM reads the compiled library and the OkHttp classes
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'org.ow2.asm:asm:9.7'
+        classpath 'org.ow2.asm:asm-tree:9.7'
+    }
+}
+
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.Handle
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.Type
+import org.objectweb.asm.tree.ClassNode
+import org.objectweb.asm.tree.FieldInsnNode
+import org.objectweb.asm.tree.InvokeDynamicInsnNode
+import org.objectweb.asm.tree.LdcInsnNode
+import org.objectweb.asm.tree.MethodInsnNode
+import org.objectweb.asm.tree.MultiANewArrayInsnNode
+import org.objectweb.asm.tree.TypeInsnNode
+
+class ApproovOkHttpCompatibility {
+    // the package whose classes and members are checked
+    static final String OKHTTP = 'okhttp3/'
+
+    /**
+     * Reads every class of the given jar streams into ClassNodes, keyed by internal name.
+     *
+     * @param jars are the jar contents to read
+     * @param withCode is true to keep the method bodies, which only the library classes need
+     * @return the classes by internal name
+     */
+    static Map<String, ClassNode> readClasses(List<byte[]> jars, boolean withCode) {
+        def classes = new TreeMap<String, ClassNode>()
+        def flags = withCode ? 0 : (ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES)
+        jars.each { bytes ->
+            def jar = new java.util.zip.ZipInputStream(new ByteArrayInputStream(bytes))
+            try {
+                for (def entry = jar.nextEntry; entry != null; entry = jar.nextEntry) {
+                    if (!entry.name.endsWith('.class') || entry.name.startsWith('META-INF/'))
+                        continue
+                    def node = new ClassNode()
+                    new ClassReader(jar.readAllBytes()).accept(node, flags)
+                    classes[node.name] = node
+                }
+            } finally {
+                jar.close()
+            }
+        }
+        return classes
+    }
+
+    /**
+     * Checks the library classes against the OkHttp classes and returns the report lines and problems.
+     *
+     * @param library are the library classes, with their code
+     * @param okhttp are the classes of the OkHttp release checked against
+     * @return a map with 'references' (one line per okhttp3 class or member referred to) and 'problems'
+     */
+    static Map<String, List<String>> check(Map<String, ClassNode> library, Map<String, ClassNode> okhttp) {
+        // classes outside OkHttp and the library (java.lang.Object and so on) come from the running JDK
+        def jdk = [:]
+        def lookup = { String name ->
+            if (okhttp.containsKey(name))
+                return okhttp[name]
+            if (library.containsKey(name))
+                return library[name]
+            if (!jdk.containsKey(name)) {
+                def stream = ClassLoader.getSystemResourceAsStream(name + '.class')
+                def node = null
+                if (stream != null) {
+                    node = new ClassNode()
+                    try {
+                        new ClassReader(stream).accept(node, ClassReader.SKIP_CODE)
+                    } finally {
+                        stream.close()
+                    }
+                }
+                jdk[name] = node
+            }
+            return jdk[name]
+        }
+
+        // finds a member as the JVM resolves it: the class, its superclasses, then its interfaces
+        def resolve
+        resolve = { String owner, String name, String desc, boolean field, Set<String> seen ->
+            if (!seen.add(owner))
+                return null
+            def node = lookup(owner)
+            if (node == null)
+                return null
+            def members = field ? node.fields : node.methods
+            def hit = members.find { (it.name == name) && (it.desc == desc) }
+            if (hit != null)
+                return [owner: owner, access: hit.access]
+            if (name == '<init>')
+                return null
+            def supertypes = ((node.superName == null) ? [] : [node.superName]) + (node.interfaces ?: [])
+            for (def supertype : supertypes) {
+                def found = resolve(supertype, name, desc, field, seen)
+                if (found != null)
+                    return found
+            }
+            return null
+        }
+
+        def classRefs = new TreeMap<String, Set<String>>()
+        def memberRefs = new TreeMap<String, Map>()
+        def addClass = { String name, String from ->
+            if ((name != null) && name.startsWith(OKHTTP))
+                classRefs.computeIfAbsent(name) { new TreeSet<String>() }.add(from)
+        }
+        def addType
+        addType = { Type type, String from ->
+            if (type.sort == Type.ARRAY)
+                addType(type.elementType, from)
+            else if (type.sort == Type.OBJECT)
+                addClass(type.internalName, from)
+            else if (type.sort == Type.METHOD) {
+                type.argumentTypes.each { addType(it, from) }
+                addType(type.returnType, from)
+            }
+        }
+        def addMember = { String kind, String owner, String name, String desc, boolean isStatic, boolean onInterface,
+                          String from ->
+            if (owner.startsWith('['))
+                return
+            if (!owner.startsWith(OKHTTP))
+                return
+            addClass(owner, from)
+            def key = "${kind} ${owner}.${name}${(kind == 'field') ? ':' : ''}${desc}"
+            def ref = memberRefs.computeIfAbsent(key) {
+                [kind: kind, owner: owner, name: name, desc: desc, isStatic: isStatic, onInterface: onInterface,
+                 from: new TreeSet<String>()]
+            }
+            ref.from.add(from)
+        }
+
+        // every okhttp3 class and member the library classes refer to
+        library.values().each { node ->
+            def from = node.name
+            addClass(node.superName, from)
+            (node.interfaces ?: []).each { addClass(it, from) }
+            node.fields.each { addType(Type.getType(it.desc), from) }
+            node.methods.each { method ->
+                addType(Type.getMethodType(method.desc), from)
+                method.tryCatchBlocks?.each { addClass(it.type, from) }
+                method.instructions.each { insn ->
+                    if (insn instanceof MethodInsnNode) {
+                        addMember('method', insn.owner, insn.name, insn.desc, insn.opcode == Opcodes.INVOKESTATIC,
+                                insn.itf, from)
+                        addType(Type.getMethodType(insn.desc), from)
+                    } else if (insn instanceof FieldInsnNode) {
+                        addMember('field', insn.owner, insn.name, insn.desc,
+                                (insn.opcode == Opcodes.GETSTATIC) || (insn.opcode == Opcodes.PUTSTATIC), false, from)
+                        addType(Type.getType(insn.desc), from)
+                    } else if (insn instanceof TypeInsnNode) {
+                        addType(insn.desc.startsWith('[') ? Type.getType(insn.desc) : Type.getObjectType(insn.desc), from)
+                    } else if (insn instanceof MultiANewArrayInsnNode) {
+                        addType(Type.getType(insn.desc), from)
+                    } else if ((insn instanceof LdcInsnNode) && (insn.cst instanceof Type)) {
+                        addType(insn.cst, from)
+                    } else if (insn instanceof InvokeDynamicInsnNode) {
+                        addType(Type.getMethodType(insn.desc), from)
+                        insn.bsmArgs.each { arg ->
+                            if (arg instanceof Type) {
+                                addType(arg, from)
+                            } else if (arg instanceof Handle) {
+                                def field = arg.tag <= Opcodes.H_PUTSTATIC
+                                def isStatic = (arg.tag == Opcodes.H_INVOKESTATIC) || (arg.tag == Opcodes.H_GETSTATIC) ||
+                                        (arg.tag == Opcodes.H_PUTSTATIC)
+                                addMember(field ? 'field' : 'method', arg.owner, arg.name, arg.desc, isStatic,
+                                        arg.isInterface(), from)
+                                addType(field ? Type.getType(arg.desc) : Type.getMethodType(arg.desc), from)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        def references = []
+        def problems = []
+        def isPublicOrProtected = { int access -> (access & (Opcodes.ACC_PUBLIC | Opcodes.ACC_PROTECTED)) != 0 }
+
+        // the classes exist and are public
+        classRefs.each { name, from ->
+            def node = okhttp[name]
+            def verdict = 'ok'
+            if (node == null)
+                verdict = 'MISSING CLASS'
+            else if ((node.access & Opcodes.ACC_PUBLIC) == 0)
+                verdict = 'NOT PUBLIC'
+            references << "class  ${name} -> ${verdict}"
+            if (verdict != 'ok')
+                problems << "${verdict} ${name}, referred to by ${from.join(', ')}"
+        }
+
+        // the members exist and link as they are referred to
+        memberRefs.each { key, ref ->
+            def verdicts = []
+            def owner = okhttp[ref.owner]
+            def found = (owner == null) ? null : resolve(ref.owner, ref.name, ref.desc, ref.kind == 'field', [] as Set)
+            if (owner == null) {
+                verdicts << 'MISSING CLASS'
+            } else if (found == null) {
+                verdicts << 'MISSING'
+            } else {
+                def isStatic = (found.access & Opcodes.ACC_STATIC) != 0
+                if (ref.isStatic != isStatic)
+                    verdicts << (isStatic ? 'NOW STATIC' : 'NOT STATIC')
+                def ownerIsInterface = (owner.access & Opcodes.ACC_INTERFACE) != 0
+                if ((ref.kind == 'method') && (ref.onInterface != ownerIsInterface))
+                    verdicts << (ownerIsInterface ? 'OWNER IS AN INTERFACE' : 'OWNER IS NOT AN INTERFACE')
+                if (!isPublicOrProtected(found.access))
+                    verdicts << 'NOT ACCESSIBLE'
+            }
+            def verdict = verdicts.isEmpty() ? 'ok' : verdicts.join(', ')
+            references << "${key} -> ${verdict}"
+            if (!verdicts.isEmpty())
+                problems << "${verdict} ${key}, referred to by ${ref.from.join(', ')}"
+        }
+
+        // a library class that extends or implements an OkHttp type implements every abstract method it
+        // has there and overrides no final one
+        library.values().each { node ->
+            def supertypes = (((node.superName == null) ? [] : [node.superName]) + (node.interfaces ?: []))
+                    .findAll { it.startsWith(OKHTTP) && okhttp.containsKey(it) }
+            if (supertypes.isEmpty())
+                return
+            def abstractMethods = new TreeSet<String>()
+            def finalMethods = new TreeSet<String>()
+            def visit
+            visit = { String name, Set<String> seen ->
+                if (!seen.add(name))
+                    return
+                def supertype = lookup(name)
+                if (supertype == null)
+                    return
+                supertype.methods.each {
+                    if ((it.access & Opcodes.ACC_ABSTRACT) != 0)
+                        abstractMethods.add(it.name + it.desc)
+                    if (((it.access & Opcodes.ACC_FINAL) != 0) && ((it.access & Opcodes.ACC_STATIC) == 0))
+                        finalMethods.add(it.name + it.desc)
+                }
+                (((supertype.superName == null) ? [] : [supertype.superName]) + (supertype.interfaces ?: []))
+                        .each { visit(it, seen) }
+            }
+            def seen = [] as Set
+            supertypes.each { visit(it, seen) }
+            def declared = node.methods.findAll { (it.access & (Opcodes.ACC_STATIC | Opcodes.ACC_PRIVATE)) == 0 }
+                    .collect { it.name + it.desc } as Set
+            finalMethods.findAll { declared.contains(it) }.each {
+                problems << "FINAL OVERRIDDEN ${it} in ${node.name}"
+            }
+            if ((node.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_INTERFACE)) != 0)
+                return
+            abstractMethods.each { method ->
+                def split = method.indexOf('(')
+                def name = method.substring(0, split)
+                def desc = method.substring(split)
+                def implemented = false
+                for (def current = node.name; (current != null) && !implemented;) {
+                    def type = lookup(current)
+                    if (type == null)
+                        break
+                    implemented = type.methods.any {
+                        (it.name == name) && (it.desc == desc) && ((it.access & Opcodes.ACC_ABSTRACT) == 0)
+                    }
+                    current = type.superName
+                }
+                // a default method of an interface implements it too
+                if (!implemented) {
+                    def found = resolve(node.name, name, desc, false, [] as Set)
+                    implemented = (found != null) && ((found.access & Opcodes.ACC_ABSTRACT) == 0)
+                }
+                if (!implemented)
+                    problems << "ABSTRACT NOT IMPLEMENTED ${method} of ${supertypes.join(', ')} in ${node.name}"
+            }
+            references << "extends ${node.name} : ${supertypes.join(', ')} -> ${abstractMethods.size()} abstract methods checked"
+        }
+
+        return [references: references, problems: problems]
+    }
+}
+
+def okhttpMinimumVersion = providers.gradleProperty('okhttpMinimumVersion').get()
+def okhttpMinimum = configurations.create('okhttpMinimum') {
+    canBeConsumed = false
+    canBeResolved = true
+    transitive = false
+    attributes {
+        attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage, Usage.JAVA_RUNTIME))
+        attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category, Category.LIBRARY))
+        attribute(LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(LibraryElements, LibraryElements.JAR))
+    }
+}
+dependencies.add(okhttpMinimum.name, "com.squareup.okhttp3:okhttp:${okhttpMinimumVersion}")
+
+tasks.register('verifyOkHttp4Compatibility') {
+    group = 'verification'
+    description = 'Fails when the release AAR refers to an OkHttp class or member that okhttpMinimumVersion does not have.'
+    dependsOn 'bundleReleaseAar'
+    def aarFile = layout.buildDirectory.file('outputs/aar/approov-service-release.aar')
+    def report = layout.buildDirectory.file("reports/okhttp-compatibility/okhttp-${okhttpMinimumVersion}.txt")
+    inputs.file(aarFile)
+    inputs.files(okhttpMinimum)
+    outputs.file(report)
+    doLast {
+        // the classes the AAR ships: classes.jar and any jar under libs/
+        def jars = []
+        def aar = new java.util.zip.ZipFile(aarFile.get().asFile)
+        try {
+            aar.entries().findAll { (it.name == 'classes.jar') || (it.name.startsWith('libs/') && it.name.endsWith('.jar')) }
+                    .sort { it.name }
+                    .each { jars << aar.getInputStream(it).bytes }
+        } finally {
+            aar.close()
+        }
+        assert !jars.isEmpty(): 'release AAR has no classes'
+        def library = ApproovOkHttpCompatibility.readClasses(jars, true)
+        def okhttp = ApproovOkHttpCompatibility.readClasses(okhttpMinimum.files.collect { it.bytes }, false)
+        assert okhttp.containsKey('okhttp3/OkHttpClient'): "OkHttp ${okhttpMinimumVersion} jar not found"
+
+        def result = ApproovOkHttpCompatibility.check(library, okhttp)
+        def out = report.get().asFile
+        out.parentFile.mkdirs()
+        out.text = (["OkHttp references of the release AAR checked against OkHttp ${okhttpMinimumVersion}"] +
+                result.references + ['', "problems: ${result.problems.size()}"] + result.problems).join('\n') + '\n'
+        def members = result.references.count { it.startsWith('method ') || it.startsWith('field ') }
+        def classes = result.references.count { it.startsWith('class ') }
+        logger.lifecycle("verifyOkHttp4Compatibility: ${classes} OkHttp classes and ${members} members referred to, " +
+                "checked against OkHttp ${okhttpMinimumVersion}: ${result.problems.size()} problems (${out})")
+        if (!result.problems.isEmpty())
+            throw new GradleException("the library refers to OkHttp that OkHttp ${okhttpMinimumVersion} does not have:\n  " +
+                    result.problems.join('\n  '))
+    }
+}

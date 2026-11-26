@@ -1,0 +1,8 @@
+rootProject.name = 'approov-gradle-plugin'
+
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}

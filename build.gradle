@@ -1,0 +1,167 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.9.0'
+    }
+}
+
+allprojects {
+    repositories {
+        mavenCentral()
+        google()
+    }
+}
+
+// Local testing against an Approov SDK that is not published yet, such as a release candidate installed in Maven
+// Local: -PapproovSdkVersion=<version>. It applies to every module, so the sample apps and their instrumented
+// tests run on the same SDK as the library. The declared dependency stays the version a release depends on, so
+// verifyReleaseSdk and the published POM are unchanged, and nothing here applies without the property.
+def approovSdkVersion = findProperty('approovSdkVersion')
+if (approovSdkVersion) {
+    allprojects {
+        repositories {
+            mavenLocal {
+                content {
+                    includeModule('io.approov', 'approov-android-sdk')
+                }
+            }
+        }
+        configurations.configureEach {
+            resolutionStrategy.eachDependency { details ->
+                if ((details.requested.group == 'io.approov') && (details.requested.name == 'approov-android-sdk'))
+                    details.useVersion(approovSdkVersion.toString())
+            }
+        }
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}
+
+def pluginTests = gradle.includedBuild('approov-gradle-plugin').task(':test')
+def pluginCoverageReport = gradle.includedBuild('approov-gradle-plugin').task(':jacocoTestReport')
+def pluginCoverageVerification =
+        gradle.includedBuild('approov-gradle-plugin').task(':jacocoTestCoverageVerification')
+
+apply from: 'gradle/version-sync.gradle'
+// verifyCentralPom: the generated POMs have everything Maven Central requires
+apply from: 'gradle/maven-central.gradle'
+
+tasks.register('verifyFast') {
+    group = 'verification'
+    description = 'Runs plugin tests, service debug JVM tests, Android lint, the version sync check and the checker self-tests.'
+    dependsOn 'verifyVersionSyncSelfTest'
+    dependsOn 'verifyCentralPomSelfTest'
+    dependsOn 'verifyVersionSync'
+    dependsOn pluginTests
+    dependsOn ':approov-service:testDebugUnitTest'
+    dependsOn ':approov-service:lintDebug'
+}
+
+tasks.register('verifyJvmAll') {
+    group = 'verification'
+    description = 'Runs the Gradle plugin tests and all service JVM build-type tests.'
+    dependsOn pluginTests
+    dependsOn ':approov-service:test'
+    dependsOn ':approov-service:jacocoDebugUnitTestReport'
+    dependsOn 'verifyArtifacts'
+    dependsOn 'verifyConsumerRelease'
+}
+
+tasks.register('verifyArtifacts') {
+    group = 'verification'
+    description = 'Inspects the release AAR, its OkHttp references and generated Maven metadata, Maven Central POM elements included.'
+    dependsOn ':approov-service:verifyReleaseAar'
+    dependsOn ':approov-service:verifyPublicationMetadata'
+    dependsOn 'verifyCentralPom'
+    dependsOn ':approov-service:verifyOkHttp4Compatibility'
+    dependsOn gradle.includedBuild('approov-gradle-plugin').task(':verifyPluginPublication')
+}
+
+tasks.register('verifyConsumerRelease') {
+    group = 'verification'
+    description = 'Builds the sample consumers with R8 and automatic weaving enabled (Cronet included), one of them with no OkHttp of its own.'
+    dependsOn ':shapes-app:assembleRelease'
+    dependsOn ':vanilla-shapes-app:assembleRelease'
+    dependsOn ':vanilla-shapes-app:verifyCronetWeave'
+    dependsOn ':urlconnection-app:verifyOkHttpFromLibrary'
+}
+
+tasks.register('verifyFuzz') {
+    group = 'verification'
+    description = 'Runs the deterministic replayable structured-fields property/fuzz corpus.'
+    dependsOn ':approov-service:testDebugUnitTest'
+}
+
+tasks.register('verifySoak') {
+    group = 'verification'
+    description = 'Runs bounded concurrency and configuration-state soak tests.'
+    dependsOn ':approov-service:testDebugUnitTest'
+}
+
+tasks.register('coverageReport') {
+    group = 'verification'
+    description = 'Generates service and Gradle-plugin JVM coverage reports.'
+    dependsOn pluginCoverageReport
+    dependsOn ':approov-service:jacocoDebugUnitTestReport'
+}
+
+tasks.register('verifyCoverage') {
+    group = 'verification'
+    description = 'Enforces the declared service and Gradle-plugin coverage gates.'
+    dependsOn pluginCoverageVerification
+    dependsOn ':approov-service:jacocoDebugCoverageVerification'
+}
+
+tasks.register('verifyRealSdk') {
+    group = 'verification'
+    description = 'Runs all credentialed service and sample-app tests on a connected Android device.'
+    dependsOn ':approov-service:connectedDebugAndroidTest'
+    dependsOn ':shapes-app:connectedDebugAndroidTest'
+    dependsOn ':vanilla-shapes-app:connectedDebugAndroidTest'
+    doLast {
+        def credentials = rootProject.file('approov.properties')
+        if (!credentials.exists()) {
+            throw new GradleException('verifyRealSdk requires git-ignored approov.properties credentials')
+        }
+    }
+}
+
+tasks.register('verifyEmulator') {
+    group = 'verification'
+    description = 'Runs only credential-free instrumented tests on the connected Android emulator.'
+    dependsOn ':approov-service:connectedDebugAndroidTest'
+    dependsOn ':shapes-app:connectedDebugAndroidTest'
+    dependsOn ':vanilla-shapes-app:connectedDebugAndroidTest'
+}
+
+tasks.register('verifyEmulatorMatrix', Exec) {
+    group = 'verification'
+    description = 'Boots the API 23/middle/target/latest AVD matrix and runs credential-free tests.'
+    commandLine 'bash', rootProject.file('scripts/run-emulator-matrix.sh'), 'deterministic'
+}
+
+tasks.register('verifyRealSdkMatrix', Exec) {
+    group = 'verification'
+    description = 'Boots the Android AVD matrix and runs trusted credentialed Approov tests.'
+    commandLine 'bash', rootProject.file('scripts/run-emulator-matrix.sh'), 'real'
+}
+
+tasks.register('verifyReleaseHost') {
+    group = 'verification'
+    description = 'Runs the complete host-side release gate: JVM, lint, fuzz, soak, artifacts, and R8 consumers.'
+    dependsOn 'verifyJvmAll'
+    dependsOn 'verifyFast'
+    dependsOn 'verifyFuzz'
+    dependsOn 'verifySoak'
+}
+
+tasks.register('verifyRelease', Exec) {
+    group = 'verification'
+    description = 'Runs the sequential clean, host, coverage, OkHttp 5 and 4, emulator, and real-SDK release gate.'
+    commandLine 'bash', rootProject.file('scripts/verify-release.sh')
+}

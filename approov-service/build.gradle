@@ -1,0 +1,614 @@
+plugins {
+    id 'com.android.library'
+    id 'jacoco'
+    id 'maven-publish'
+    // only the ShadowJar task type is used, to relocate Tink (see relocatedTinkJar)
+    id 'com.gradleup.shadow' version '9.6.1' apply false
+}
+
+group = 'io.approov'
+version = project.findProperty('approovServiceVersion') ?: '0.0.0-dev'
+
+repositories {
+    mavenCentral()
+    google()
+}
+
+// The library declares the OkHttp of okhttpVersion (gradle.properties) through the OkHttp BOM and
+// compiles against it. A native app resolves the highest OkHttp its dependencies ask for, so at run time
+// the library works on that OkHttp or on a later one. A React Native app declares the library with the
+// OkHttp group excluded and keeps React Native's OkHttp 4, so the library also works on OkHttp 4.9.2 and
+// later. The JVM tests therefore run on okhttpVersion by default, and on the OkHttp named by
+// -PokhttpTestVersion (for example 4.9.2, 4.12.0 or 5.5.0), which only changes the test classpath. A 5.x
+// run also compiles the tests in src/testOkHttp5, which use API that OkHttp 4 does not have.
+def okhttpVersion = providers.gradleProperty('okhttpVersion').get()
+def okhttpTestVersion = (project.findProperty('okhttpTestVersion') ?: okhttpVersion).toString()
+if (!(okhttpTestVersion ==~ /[45]\.\d+\.\d+/))
+    throw new GradleException("okhttpTestVersion must be an OkHttp 4.x or 5.x release, found '${okhttpTestVersion}'")
+def okhttp5Tests = okhttpTestVersion.startsWith('5.')
+
+// The library's OkHttp BOM would raise an OkHttp 4 test classpath back to okhttpVersion, so a 4.x run
+// takes the BOM off the unit-test classpaths only, as an app that excludes the OkHttp group does. The
+// library's own classes stay compiled against okhttpVersion. OkHttpTestVersionTest fails a run that is
+// not on the OkHttp it asked for.
+if (!okhttp5Tests) {
+    configurations.matching { it.name ==~ /.*UnitTest(Compile|Runtime)Classpath/ }.configureEach {
+        exclude group: 'com.squareup.okhttp3', module: 'okhttp-bom'
+    }
+}
+
+// The Approov account ID, development key and test hosts for the
+// instrumented real-SDK tests come from the git-ignored approov.properties (see
+// approov.properties.example).
+// They are written into an asset of the androidTest APK only, never into the
+// library's BuildConfig: anything in BuildConfig is part of the published AAR and,
+// through the consumer keep rule, of every app that uses it (verifyReleaseAar
+// checks this). The test reads the asset with the instrumentation context.
+abstract class GenerateApproovTestCredentials extends DefaultTask {
+    @InputFiles
+    @PathSensitive(PathSensitivity.NONE)
+    abstract ConfigurableFileCollection getCredentials()
+
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDir()
+
+    @TaskAction
+    void generate() {
+        def props = new Properties()
+        credentials.files.findAll { it.isFile() }.each { file ->
+            file.withInputStream { props.load(it) }
+        }
+        def out = new Properties()
+        out.setProperty('approov.config', props.getProperty('approov.config', ''))
+        out.setProperty('approov.devkey', props.getProperty('approov.devkey', ''))
+        // the bounce (echo) worker hosts the tests send real requests to
+        out.setProperty('approov.host.protected', props.getProperty('approov.host.protected', ''))
+        out.setProperty('approov.host.not-added', props.getProperty('approov.host.not-added', ''))
+        def dir = outputDir.get().asFile
+        dir.mkdirs()
+        new File(dir, 'approov-test-credentials.properties').withOutputStream {
+            out.store(it, 'generated from approov.properties for the androidTest APK only')
+        }
+    }
+}
+
+def generateApproovTestCredentials = tasks.register('generateApproovTestCredentials',
+        GenerateApproovTestCredentials) {
+    credentials.from(rootProject.file('approov.properties'))
+    outputDir.set(layout.buildDirectory.dir('generated/approov-test-credentials'))
+}
+
+android {
+    namespace = "io.approov.service.android"
+    compileSdk 34
+
+    defaultConfig {
+        minSdkVersion 23
+        targetSdkVersion 34
+        consumerProguardFiles 'consumer-rules.pro'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        // Release automation supplies -PapproovServiceVersion=X.Y.Z. Local and
+        // test builds identify themselves as development builds.
+        def serviceVersion = project.findProperty('approovServiceVersion') ?: 'dev'
+        buildConfigField "String", "APPROOV_SERVICE_VERSION", "\"${serviceVersion}\""
+        if (gradle.startParameter.taskNames.any { it.tokenize(':').last() == 'verifyEmulator' }) {
+            testInstrumentationRunnerArguments notAnnotation: 'io.approov.testing.RealSdkTest'
+        } else if (gradle.startParameter.taskNames.any { it.tokenize(':').last() == 'verifyRealSdk' }) {
+            testInstrumentationRunnerArguments annotation: 'io.approov.testing.RealSdkTest'
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+    publishing {
+        singleVariant('release') {
+            // Maven Central requires a sources and a javadoc jar beside the AAR
+            withSourcesJar()
+            withJavadocJar()
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    if (okhttp5Tests) {
+        sourceSets.test.java.srcDir 'src/testOkHttp5/java'
+    }
+    testOptions {
+        unitTests.returnDefaultValues = true
+        unitTests.all {
+            jacoco.includeNoLocationClasses = true
+            jacoco.excludes = ['jdk.internal.*']
+            // OkHttpTestVersionTest checks that the tests really run on this OkHttp
+            systemProperty 'approov.okhttpTestVersion', okhttpTestVersion
+            // a run on another OkHttp keeps its results apart from those of the default run
+            if (okhttpTestVersion != okhttpVersion) {
+                def lane = "${name}-okhttp-${okhttpTestVersion}"
+                reports.junitXml.outputLocation = layout.buildDirectory.dir("test-results/${lane}")
+                reports.html.outputLocation = layout.buildDirectory.dir("reports/tests/${lane}")
+                binaryResultsDirectory = layout.buildDirectory.dir("test-results/${lane}/binary")
+            }
+            def requestedTasks = gradle.startParameter.taskNames.collect { it.tokenize(':').last() }
+            def focusedLane = !requestedTasks.any {
+                it in ['verifyFast', 'verifyJvmAll', 'verifyReleaseHost']
+            }
+            if (focusedLane && requestedTasks.contains('verifyFuzz')) {
+                filter.includeTestsMatching 'io.approov.util.universal.http.sfv.SfvPropertyFuzzTest'
+                systemProperty 'approov.fuzz.seed', System.getProperty(
+                        'approov.fuzz.seed', '4706358846802486860')
+                systemProperty 'approov.fuzz.iterations', System.getProperty(
+                        'approov.fuzz.iterations', '5000')
+            }
+            if (focusedLane && requestedTasks.contains('verifySoak')) {
+                filter.includeTestsMatching 'io.approov.service.android.ApproovConfigurationConcurrencySoakTest'
+                filter.includeTestsMatching 'io.approov.service.android.ApproovTransportConcurrencyBurstTest'
+                systemProperty 'approov.soak.threads', System.getProperty('approov.soak.threads', '8')
+                systemProperty 'approov.soak.iterations', System.getProperty('approov.soak.iterations', '2000')
+                systemProperty 'approov.transport.threads', System.getProperty('approov.transport.threads', '64')
+                systemProperty 'approov.transport.requestsPerWorker', System.getProperty(
+                        'approov.transport.requestsPerWorker', '4')
+            }
+        }
+    }
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.androidTest?.sources?.assets?.addGeneratedSourceDirectory(
+                generateApproovTestCredentials, GenerateApproovTestCredentials::getOutputDir)
+    }
+}
+
+jacoco {
+    toolVersion = '0.8.12'
+}
+
+def coverageExclusions = [
+        '**/R.class',
+        '**/R$*.class',
+        '**/BuildConfig.*',
+        '**/Manifest*.*'
+]
+def debugCoverageClasses = files(fileTree(
+        dir: layout.buildDirectory.dir('intermediates/javac/debug/compileDebugJavaWithJavac/classes'),
+        excludes: coverageExclusions))
+def debugCoverageSources = files('src/main/java')
+def debugCoverageData = fileTree(layout.buildDirectory) {
+    include 'jacoco/testDebugUnitTest.exec'
+    include 'outputs/unit_test_code_coverage/debugUnitTest/testDebugUnitTest.exec'
+}
+
+tasks.register('jacocoDebugUnitTestReport', JacocoReport) {
+    group = 'verification'
+    description = 'Generates HTML and XML coverage for debug JVM tests.'
+    dependsOn 'testDebugUnitTest'
+    classDirectories.setFrom(debugCoverageClasses)
+    sourceDirectories.setFrom(debugCoverageSources)
+    executionData.setFrom(debugCoverageData)
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+}
+
+tasks.register('jacocoDebugCoverageVerification', JacocoCoverageVerification) {
+    group = 'verification'
+    description = 'Enforces the initial whole-service line and branch coverage gates.'
+    dependsOn 'testDebugUnitTest'
+    classDirectories.setFrom(debugCoverageClasses)
+    sourceDirectories.setFrom(debugCoverageSources)
+    executionData.setFrom(debugCoverageData)
+    violationRules {
+        rule {
+            limit {
+                counter = 'LINE'
+                value = 'COVEREDRATIO'
+                minimum = 0.85
+            }
+            limit {
+                counter = 'BRANCH'
+                value = 'COVEREDRATIO'
+                minimum = 0.75
+            }
+        }
+    }
+}
+
+// Tink converts the SDK's DER install signature to raw r||s. It is bundled
+// inside the AAR, relocated with its runtime dependencies under
+// io.approov.util.universal, so apps that ship their own Tink, protobuf or Gson
+// never see duplicate classes. The published POM therefore carries no Tink
+// dependency. The version is pinned because EllipticCurves sits in Tink's
+// subtle package, which has no API stability promise; Es256DerToRawTest pins
+// its behaviour.
+configurations {
+    relocatedTink {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+}
+
+def relocatedTinkJar = tasks.register('relocatedTinkJar', com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar) {
+    description = 'Bundles Tink and its runtime dependencies relocated under io.approov.util.universal.'
+    archiveBaseName.set('approov-relocated-tink')
+    archiveVersion.set('')
+    archiveClassifier.set('')
+    destinationDirectory.set(layout.buildDirectory.dir('relocated-tink'))
+    configurations = [project.configurations.relocatedTink]
+    relocate 'com.google.crypto.tink', 'io.approov.util.universal.tink'
+    relocate 'com.google.gson', 'io.approov.util.universal.gson'
+    relocate 'com.google.errorprone.annotations', 'io.approov.util.universal.errorprone.annotations'
+    relocate 'javax.annotation', 'io.approov.util.universal.jsr305'
+    // embedded R8 rules name the old packages; the one Tink rule that is still
+    // relevant is restated for the relocated package in consumer-rules.pro
+    exclude 'META-INF/**'
+    exclude '**/module-info.class'
+}
+
+dependencies {
+    // the Approov SDK is api: the library's public API exposes its types (getTokenFetchStatus() of the
+    // exceptions returns Approov.TokenFetchStatus), so an app, or a module such as the React Native one,
+    // compiles against the SDK this library brings and never declares a version of its own
+    api 'io.approov:approov-android-sdk:3.7.0'
+    // the supporting libraries are always required
+    relocatedTink('com.google.crypto.tink:tink-android:1.23.0') {
+        // androidx.annotation is a regular dependency of this library below
+        exclude group: 'androidx.annotation'
+    }
+    implementation files(relocatedTinkJar)
+    implementation 'androidx.annotation:annotation:1.9.1'
+
+    // OkHttp is a dependency of the library: the Approov SDK makes its own calls with it and declares
+    // no dependencies, so without this an app with no OkHttp of its own would have none for the SDK.
+    // It is implementation, so the published POM gives it the runtime scope as the per-library layers
+    // do: an app gets it at run time but not on its compile classpath, and an app that uses the OkHttp
+    // types of ApproovOkHttp declares OkHttp itself. OkHttp 5 gives the app's calls and the SDK's the
+    // fast fallback between IPv6 and IPv4 addresses. The version comes from the OkHttp BOM, so an app's
+    // other OkHttp artifacts (such as okhttp-urlconnection, logging-interceptor or okhttp-sse) are raised
+    // to the same release as okhttp itself, since OkHttp artifacts of different major versions do not
+    // work together. This is a minimum: an app that declares a later OkHttp gets its own. React Native
+    // apps declare the library with the com.squareup.okhttp3 group excluded and keep React Native's
+    // OkHttp 4, so the library must not use anything OkHttp 4.9.2 lacks (verifyOkHttp4Compatibility).
+    implementation platform("com.squareup.okhttp3:okhttp-bom:${okhttpVersion}")
+    implementation "com.squareup.okhttp3:okhttp"
+
+    // the other networking stacks are compileOnly: only the adapters whose stack is
+    // actually present in the consuming app can be used, and none of them is
+    // added to the app's dependency graph
+    compileOnly 'com.android.volley:volley:1.2.1'
+    compileOnly 'io.grpc:grpc-api:1.62.2'
+    compileOnly 'io.grpc:grpc-core:1.62.2'
+    compileOnly 'io.grpc:grpc-okhttp:1.62.2'
+    // Cronet: the app brings its own (cronet-embedded, Play Services Cronet or a
+    // library such as react-native-nitro-fetch). The cronet adapter is loaded only
+    // when the app uses it, so an app without Cronet never loads a Cronet class.
+    compileOnly 'org.chromium.net:cronet-api:143.7445.0'
+
+    // okio is used for Buffer (the request body for message signing) and ByteString (base64 and hex of
+    // the Cronet pins); this is the lowest okio with that API, so the library never raises okio, and with
+    // it the Kotlin standard library, above what an app's OkHttp asks for: OkHttp 5 brings its own higher
+    // okio, and an app that keeps OkHttp 4 keeps an okio its Kotlin can read (verifyPublicationMetadata)
+    implementation 'com.squareup.okio:okio:3.6.0'
+
+    testImplementation 'junit:junit:4.13.2'
+    // the OkHttp the tests run on, which is the library's own unless -PokhttpTestVersion names another one
+    testImplementation "com.squareup.okhttp3:okhttp:${okhttpTestVersion}"
+    testImplementation 'org.mockito:mockito-core:5.11.0'
+    testImplementation 'com.google.code.gson:gson:2.11.0'
+    // the stack libraries are compileOnly for the library itself but the unit
+    // tests exercise the per-stack adapters directly, so they need them present
+    testImplementation 'com.android.volley:volley:1.2.1'
+    // Volley's BasicNetwork references legacy Apache HTTP types that the Android
+    // platform provides on devices but the unit-test android.jar does not
+    testImplementation 'org.apache.httpcomponents:httpcore:4.4.16'
+    testImplementation 'io.grpc:grpc-api:1.62.2'
+    testImplementation 'io.grpc:grpc-okhttp:1.62.2'
+    // the Cronet adapter is tested against the Cronet API with fake engines
+    testImplementation 'org.chromium.net:cronet-api:143.7445.0'
+    // a real local HTTPS server for the woven end-to-end test (inspect the bytes
+    // that actually reach the wire) plus self-signed TLS material for it, from the
+    // same OkHttp release as the tests run on
+    testImplementation "com.squareup.okhttp3:mockwebserver:${okhttpTestVersion}"
+    testImplementation "com.squareup.okhttp3:okhttp-tls:${okhttpTestVersion}"
+    // OkHttp's own logging interceptor, as an app adds it, to show what the app's network interceptors see
+    testImplementation "com.squareup.okhttp3:logging-interceptor:${okhttpTestVersion}"
+
+    // instrumented tests exercising the real Approov SDK on a device/emulator
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                artifactId = 'service.android'
+                pom {
+                    name = 'Approov Package for Android'
+                    description = 'Approov protection for the OkHttp, HttpsURLConnection, Volley, gRPC and Cronet networking stacks of Android apps'
+                }
+            }
+        }
+        repositories {
+            maven {
+                name = 'test'
+                url = layout.buildDirectory.dir('test-maven-repository')
+            }
+        }
+    }
+}
+
+// the URL, licence, developers and scm of the POM that Maven Central requires, and the centralBundle
+// repository of .maven/build-bundle.sh
+apply from: rootProject.file('gradle/publication-pom.gradle')
+
+// every publish, to any repository, first checks that a release from 3.7.0 on is not built on a 3.5.x Approov SDK
+tasks.withType(AbstractPublishToMaven).configureEach {
+    dependsOn rootProject.tasks.named('verifyReleaseSdk')
+}
+
+def releaseAar = layout.buildDirectory.file('outputs/aar/approov-service-release.aar')
+tasks.register('verifyReleaseAar') {
+    group = 'verification'
+    description = 'Inspects the release AAR for required content, accidental bundled dependencies or optional stacks and unrelocated bundled libraries.'
+    dependsOn 'bundleReleaseAar'
+    inputs.file(releaseAar)
+    doLast {
+        def archive = releaseAar.get().asFile
+        assert archive.isFile(): "release AAR not found: ${archive}"
+        def aar = new java.util.zip.ZipFile(archive)
+        try {
+            assert aar.getEntry('classes.jar') != null: 'release AAR has no classes.jar'
+            assert aar.getEntry('proguard.txt') != null: 'release AAR has no consumer ProGuard rules'
+            def rules = aar.getInputStream(aar.getEntry('proguard.txt')).getText('UTF-8')
+            // the Approov SDK ships no R8 rules, and the
+            // compile-only Cronet stack must not be reported missing in apps without it
+            ['-keep class com.criticalblue.approovsdk.** { *; }',
+             '-dontwarn org.chromium.net.**',
+             '-keepnames class org.chromium.net.impl.CronetUrlRequestContext',
+             '-keepnames class org.chromium.net.impl.JavaCronetEngine'].each {
+                assert rules.contains(it): "consumer ProGuard rules miss: ${it}"
+            }
+            // OkHttp is a dependency of the library, so a missing OkHttp class in an app is an error
+            // that R8 must report
+            assert !rules.contains('-dontwarn okhttp3'): 'consumer ProGuard rules hide missing OkHttp classes'
+
+            def required = [
+                    'io/approov/service/android/ApproovService.class',
+                    'io/approov/service/android/okhttp/ApproovOkHttpWeaver.class',
+                    'io/approov/service/android/httpsurlconn/ApproovUrlConnectionWeaver.class',
+                    'io/approov/service/android/volley/ApproovVolleyWeaver.class',
+                    'io/approov/service/android/cronet/ApproovCronetWeaver.class',
+                    'io/approov/service/android/cronet/ApproovCronetEngineBuilder.class',
+                    'io/approov/util/universal/tink/subtle/EllipticCurves.class',
+                    'io/approov/util/universal/http/sfv/Parser.class',
+                    'io/approov/util/universal/sig/SignatureBaseBuilder.class'
+            ] as Set
+            // OkHttp and okio are dependencies and are never bundled, optional stacks must
+            // stay compile-only, and anything bundled must be relocated under
+            // io/approov/util/universal/ so that it cannot collide with an app's own
+            // copy or another Approov layer
+            def forbidden = [
+                    'okhttp3/': 'OkHttp',
+                    'okio/': 'okio',
+                    'com/android/volley/': 'optional Volley',
+                    'io/grpc/': 'optional gRPC',
+                    'org/chromium/': 'optional Cronet',
+                    'org/bouncycastle/': 'BouncyCastle',
+                    'com/google/': 'unrelocated Google (Tink, protobuf, Gson, Error Prone)',
+                    'javax/annotation/': 'unrelocated JSR-305',
+                    // the pre-relocation names that every other Approov Android layer ships
+                    'io/approov/util/http/': 'colliding Structured Fields',
+                    'io/approov/util/sig/': 'colliding message-signature'
+            ]
+            def found = [] as Set
+            def jars = aar.entries().findAll { it.name == 'classes.jar' || (it.name.startsWith('libs/') && it.name.endsWith('.jar')) }
+            jars.each { jar ->
+                def classes = new java.util.zip.ZipInputStream(aar.getInputStream(jar))
+                try {
+                    for (def entry = classes.nextEntry; entry != null; entry = classes.nextEntry) {
+                        if (required.contains(entry.name)) found.add(entry.name)
+                        forbidden.each { prefix, what ->
+                            assert !entry.name.startsWith(prefix): "AAR ${jar.name} bundles ${what} class ${entry.name}"
+                        }
+                        if (entry.name.endsWith('.class')) {
+                            assert entry.name.startsWith('io/approov/'): "AAR ${jar.name} bundles non-Approov class ${entry.name}"
+                        }
+                    }
+                } finally {
+                    classes.close()
+                }
+            }
+            assert found == required: "release AAR missing entry points: ${required - found}"
+
+            // The Approov account ID and development key of the instrumented tests
+            // must never reach the published library: a dev key in a customer APK
+            // forces attestation to pass. No entry may carry the BuildConfig fields
+            // that once held them, any credential value from approov.properties, or
+            // anything shaped like an account ID ("#account#...").
+            def leaks = []
+            def credentialValues = []
+            def credentials = rootProject.file('approov.properties')
+            if (credentials.isFile()) {
+                def props = new Properties()
+                credentials.withInputStream { props.load(it) }
+                props.values().each { value ->
+                    if ((value != null) && (value.toString().trim().length() >= 6))
+                        credentialValues.add(value.toString().trim())
+                }
+            }
+            def accountIdShape = ~/#[a-z0-9-]{3,}#[A-Za-z0-9+\/=]{8,}/
+            def inspect
+            inspect = { String where, byte[] bytes ->
+                def text = new String(bytes, 'ISO-8859-1')
+                ['APPROOV_CONFIG', 'APPROOV_DEV_KEY'].each {
+                    if (text.contains(it)) leaks.add("${where} contains the field name ${it}")
+                }
+                credentialValues.each {
+                    if (text.contains(it)) leaks.add("${where} contains a credential value from approov.properties")
+                }
+                if (where.endsWith('.class') && (text =~ accountIdShape).find())
+                    leaks.add("${where} contains a string shaped like an Approov account ID")
+            }
+            aar.entries().each { entry ->
+                if (entry.isDirectory()) return
+                def bytes = aar.getInputStream(entry).bytes
+                if (entry.name.endsWith('.jar')) {
+                    def nested = new java.util.zip.ZipInputStream(new ByteArrayInputStream(bytes))
+                    try {
+                        for (def inner = nested.nextEntry; inner != null; inner = nested.nextEntry) {
+                            if (!inner.isDirectory())
+                                inspect("${entry.name}!${inner.name}", nested.readAllBytes())
+                        }
+                    } finally {
+                        nested.close()
+                    }
+                } else {
+                    inspect(entry.name, bytes)
+                }
+            }
+            assert leaks.isEmpty(): "release AAR leaks Approov credentials: ${leaks.unique()}"
+        } finally {
+            aar.close()
+        }
+    }
+}
+
+// verifyOkHttp4Compatibility: the compiled library refers to nothing that okhttpMinimumVersion lacks
+apply from: rootProject.file('gradle/okhttp-compatibility.gradle')
+
+tasks.register('verifyPublicationMetadata') {
+    group = 'verification'
+    description = 'Checks that the generated POM and Gradle module metadata carry OkHttp for apps and keep the other networking stacks optional.'
+    dependsOn 'generatePomFileForReleasePublication', 'generateMetadataFileForReleasePublication'
+    def declaredOkHttp = providers.gradleProperty('okhttpVersion')
+    // the okio that the release runtime classpath resolves to, which is the highest any dependency asks for
+    def resolvedOkio = configurations.named('releaseRuntimeClasspath').map { classpath ->
+        classpath.incoming.resolutionResult.allComponents.collect { it.moduleVersion }
+                .find { (it != null) && (it.group == 'com.squareup.okio') && (it.name == 'okio') }?.version
+    }
+    // the okio that the OkHttp of okhttpVersion itself asks for (OkHttp 5 on Android: okhttp-android)
+    def okhttpOkio = configurations.named('releaseRuntimeClasspath').map { classpath ->
+        classpath.incoming.resolutionResult.allDependencies.find {
+            (it.from.moduleVersion?.group == 'com.squareup.okhttp3') &&
+                    (it.from.moduleVersion?.name in ['okhttp', 'okhttp-android', 'okhttp-jvm']) &&
+                    (it.requested instanceof ModuleComponentSelector) &&
+                    (it.requested.group == 'com.squareup.okio') && (it.requested.module == 'okio')
+        }?.requested?.version
+    }
+    doLast {
+        def pom = layout.buildDirectory.file('publications/release/pom-default.xml').get().asFile
+        assert pom.isFile(): "generated POM not found: ${pom}"
+        def dependencies = new groovy.xml.XmlSlurper().parse(pom).dependencies.dependency
+        def artifacts = dependencies.collect { it.artifactId.text() } as Set
+        def pomFile = new groovy.xml.XmlSlurper().parse(pom)
+        assert pomFile.groupId.text() == 'io.approov': "POM groupId is ${pomFile.groupId.text()}"
+        assert pomFile.artifactId.text() == 'service.android': "POM artifactId is ${pomFile.artifactId.text()}"
+        ['approov-android-sdk', 'annotation', 'okio'].each {
+            assert artifacts.contains(it): "generated POM is missing runtime dependency ${it}"
+        }
+        // the SDK is part of the library's API, so it is in the compile scope, not runtime
+        def sdk = dependencies.find {
+            (it.groupId.text() == 'io.approov') && (it.artifactId.text() == 'approov-android-sdk')
+        }
+        assert sdk.scope.text() == 'compile': "generated POM gives the Approov SDK the ${sdk.scope.text()} scope, not compile"
+
+        // the Approov SDK makes its own calls with OkHttp, so an app must get it at run time; an app that
+        // uses the OkHttp types of ApproovOkHttp declares OkHttp itself, so the library does not put it
+        // on the app's compile classpath: runtime scope in the POM, as the per-library layers have it
+        def okhttp = dependencies.find {
+            (it.groupId.text() == 'com.squareup.okhttp3') && (it.artifactId.text() == 'okhttp')
+        }
+        assert okhttp.size() == 1: 'generated POM is missing the OkHttp dependency'
+        // the version comes from the OkHttp BOM, which the POM imports in its dependencyManagement
+        assert okhttp.version.text() == '': "generated POM gives OkHttp its own version ${okhttp.version.text()}"
+        assert okhttp.scope.text() == 'runtime': "generated POM gives OkHttp the ${okhttp.scope.text()} scope, not runtime"
+        def bom = pomFile.dependencyManagement.dependencies.dependency.find {
+            (it.groupId.text() == 'com.squareup.okhttp3') && (it.artifactId.text() == 'okhttp-bom')
+        }
+        assert bom.size() == 1: 'generated POM does not import the OkHttp BOM'
+        assert bom.version.text() == declaredOkHttp.get():
+                "generated POM imports the OkHttp BOM ${bom.version.text()}, not okhttpVersion ${declaredOkHttp.get()}"
+        assert (bom.type.text() == 'pom') && (bom.scope.text() == 'import'):
+                "generated POM does not import the OkHttp BOM: type ${bom.type.text()}, scope ${bom.scope.text()}"
+
+        // and in the runtime variant of the Gradle module metadata, which is what an Android build reads;
+        // the API variant names neither OkHttp nor its BOM, so OkHttp stays off the app's compile classpath
+        def module = layout.buildDirectory.file('publications/release/module.json').get().asFile
+        assert module.isFile(): "generated Gradle module metadata not found: ${module}"
+        def variants = new groovy.json.JsonSlurper().parse(module).variants
+        def libraryVariant = { String usage ->
+            def variant = variants.find {
+                (it.attributes['org.gradle.usage'] == usage) && (it.attributes['org.gradle.category'] == 'library')
+            }
+            assert variant != null: "Gradle module metadata has no ${usage} library variant"
+            variant
+        }
+        def apiVariant = libraryVariant('java-api')
+        def apiOkHttp = apiVariant.dependencies?.findAll { it.group == 'com.squareup.okhttp3' }*.module
+        assert !apiOkHttp: "Gradle module metadata java-api variant ${apiVariant.name} names OkHttp: ${apiOkHttp}"
+        assert apiVariant.dependencies?.find { (it.group == 'io.approov') && (it.module == 'approov-android-sdk') }:
+                "Gradle module metadata java-api variant ${apiVariant.name} is missing the Approov SDK"
+        def usage = 'java-runtime'
+        def variant = libraryVariant(usage)
+        def dependency = variant.dependencies?.find {
+            (it.group == 'com.squareup.okhttp3') && (it.module == 'okhttp')
+        }
+        assert dependency != null: "Gradle module metadata ${usage} variant ${variant.name} is missing OkHttp"
+        // no version of its own: the OkHttp BOM, a platform dependency of the same variant, gives it
+        assert dependency.version == null:
+                "Gradle module metadata ${usage} variant gives OkHttp its own version: ${dependency.version}"
+        def platform = variant.dependencies?.find {
+            (it.group == 'com.squareup.okhttp3') && (it.module == 'okhttp-bom')
+        }
+        assert platform != null: "Gradle module metadata ${usage} variant ${variant.name} is missing the OkHttp BOM"
+        assert platform.attributes?.get('org.gradle.category') == 'platform':
+                "Gradle module metadata ${usage} variant does not name the OkHttp BOM as a platform: ${platform}"
+        assert platform.version.requires == declaredOkHttp.get():
+                "Gradle module metadata ${usage} variant names the OkHttp BOM ${platform.version.requires}, not okhttpVersion ${declaredOkHttp.get()}"
+        // a plain requirement and not an enforced platform, so that an app that declares a higher
+        // OkHttp gets its own
+        assert (platform.version.strictly == null) && (platform.version.prefers == null):
+                "Gradle module metadata ${usage} variant constrains OkHttp beyond a minimum: ${platform.version}"
+
+        // the okio the library declares is a minimum that never raises okio above what OkHttp asks for:
+        // with the library's own OkHttp the okio that resolves is OkHttp's, and an app that downgrades
+        // or excludes OkHttp is not lifted onto okio 3.16 and the Kotlin 2.2 standard library it brings
+        def okio = dependencies.find {
+            (it.groupId.text() == 'com.squareup.okio') && (it.artifactId.text() == 'okio')
+        }
+        assert okio.size() == 1: 'generated POM is missing the okio dependency'
+        def numbers = { String v -> v.tokenize('.-').findAll { it.isInteger() }.collect { it.toInteger() } }
+        def notAbove = { String a, String b ->
+            def x = numbers(a), y = numbers(b)
+            def i = (0..<Math.min(x.size(), y.size())).find { x[it] != y[it] }
+            (i == null) ? (x.size() <= y.size()) : (x[i] < y[i])
+        }
+        assert okhttpOkio.getOrNull() != null: 'OkHttp does not ask for okio on the release runtime classpath'
+        assert resolvedOkio.get() == okhttpOkio.get():
+                "the release runtime classpath resolves okio ${resolvedOkio.get()}, not the okio ${okhttpOkio.get()} that OkHttp asks for"
+        assert notAbove(okio.version.text(), okhttpOkio.get()):
+                "the library declares okio ${okio.version.text()}, above the okio ${okhttpOkio.get()} that OkHttp asks for"
+
+        // BouncyCastle is gone and Tink is bundled relocated, so neither may be a
+        // dependency of the published library
+        def groups = dependencies.collect { it.groupId.text() } as Set
+        ['org.bouncycastle', 'com.google.crypto.tink', 'com.google.code.gson'].each {
+            assert !groups.contains(it): "bundled or removed library leaked into generated POM: ${it}"
+        }
+        ['volley', 'grpc-api', 'grpc-core', 'grpc-okhttp', 'cronet-api'].each {
+            assert !artifacts.contains(it): "compile-only stack leaked into generated POM: ${it}"
+        }
+    }
+}
+

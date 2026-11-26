@@ -1,0 +1,48 @@
+// The POM content Maven Central requires of every published module, applied by the library
+// (approov-service) and the Gradle plugin (approov-gradle-plugin) to all their Maven publications, the
+// plugin marker included: the project URL, the licence, the developers and the source repository. Each
+// publication sets its own name and description. verifyCentralPom (gradle/maven-central.gradle) fails the
+// build when a generated POM misses any element that Maven Central requires.
+
+def repositoryUrl = 'https://github.com/approov-alpha/approov-service-android'
+
+plugins.withId('maven-publish') {
+    publishing.publications.withType(MavenPublication).configureEach {
+        pom {
+            url = repositoryUrl
+            licenses {
+                license {
+                    name = 'MIT License'
+                    url = 'https://opensource.org/licenses/MIT'
+                    distribution = 'repo'
+                }
+            }
+            developers {
+                developer {
+                    id = 'approov'
+                    name = 'Approov'
+                    email = 'support@approov.io'
+                    organization = 'Approov Ltd'
+                    organizationUrl = 'https://approov.io'
+                }
+            }
+            scm {
+                connection = 'scm:git:git://github.com/approov-alpha/approov-service-android.git'
+                developerConnection = 'scm:git:ssh://github.com/approov-alpha/approov-service-android.git'
+                url = repositoryUrl
+            }
+        }
+    }
+
+    // the Maven Central bundle (.maven/build-bundle.sh) is written by publishing to a local file repository
+    // that -PapproovBundleRepository names; without the property there is no such repository
+    def bundleRepository = providers.gradleProperty('approovBundleRepository').orNull
+    if (bundleRepository != null) {
+        publishing.repositories {
+            maven {
+                name = 'centralBundle'
+                url = file(bundleRepository)
+            }
+        }
+    }
+}

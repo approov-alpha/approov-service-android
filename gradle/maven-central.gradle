@@ -1,0 +1,133 @@
+// Maven Central POM check (applied from the root build.gradle).
+//
+// Maven Central refuses a component whose POM lacks a name, a description, a project URL, a licence with
+// a name and URL, a developer, or an scm block with connection, developerConnection and url
+// (https://central.sonatype.org/publish/requirements/). verifyCentralPom checks the POMs Gradle generates
+// for the library, the Gradle plugin and the plugin marker, and verifyCentralPomSelfTest runs the same
+// checker on fixtures, so a checker that stops detecting a missing element fails the build too.
+
+class ApproovCentralPom {
+    /**
+     * Checks one generated POM and returns one message per element Maven Central requires that it lacks;
+     * an empty list means Maven Central accepts it.
+     */
+    static List<String> check(File pomFile) {
+        def errors = []
+        if (!pomFile.isFile()) {
+            errors << "POM not found: ${pomFile}"
+            return errors
+        }
+        def pom = new groovy.xml.XmlSlurper().parse(pomFile)
+        def where = "${pom.groupId.text()}:${pom.artifactId.text()}"
+        def blank = { it == null || it.text().trim().isEmpty() }
+        ['groupId', 'artifactId', 'version', 'name', 'description', 'url'].each {
+            if (blank(pom."${it}"))
+                errors << "${where} POM has no ${it}"
+        }
+        if (pom.version.text().endsWith('-SNAPSHOT'))
+            errors << "${where} POM version ${pom.version.text()} is a SNAPSHOT, which Maven Central refuses"
+
+        def licenses = pom.licenses.license
+        if (licenses.size() == 0)
+            errors << "${where} POM has no licenses"
+        licenses.each { license ->
+            if (blank(license.name) || blank(license.url))
+                errors << "${where} POM has a license without a name or url"
+        }
+
+        def developers = pom.developers.developer
+        if (developers.size() == 0)
+            errors << "${where} POM has no developers"
+        developers.each { developer ->
+            if (blank(developer.name) && blank(developer.id))
+                errors << "${where} POM has a developer without a name or id"
+        }
+
+        if (pom.scm.size() == 0) {
+            errors << "${where} POM has no scm"
+        } else {
+            ['connection', 'developerConnection', 'url'].each {
+                if (blank(pom.scm."${it}"))
+                    errors << "${where} POM scm has no ${it}"
+            }
+        }
+        return errors
+    }
+}
+
+def pluginBuild = gradle.includedBuild('approov-gradle-plugin')
+def centralPoms = [
+        file('approov-service/build/publications/release/pom-default.xml'),
+        file('approov-gradle-plugin/build/publications/pluginMaven/pom-default.xml'),
+        file('approov-gradle-plugin/build/publications/approovPluginMarkerMaven/pom-default.xml'),
+]
+
+tasks.register('verifyCentralPom') {
+    group = 'verification'
+    description = 'Fails when a generated POM of the library, the Gradle plugin or its marker lacks an element Maven Central requires.'
+    dependsOn ':approov-service:generatePomFileForReleasePublication'
+    dependsOn pluginBuild.task(':generatePomFileForPluginMavenPublication')
+    dependsOn pluginBuild.task(':generatePomFileForApproovPluginMarkerMavenPublication')
+    def poms = centralPoms
+    doLast {
+        def errors = poms.collectMany { ApproovCentralPom.check(it) }
+        if (!errors.isEmpty())
+            throw new GradleException("Generated POMs incomplete for Maven Central:\n  " + errors.join('\n  '))
+    }
+}
+
+tasks.register('verifyCentralPomSelfTest') {
+    group = 'verification'
+    description = 'Runs the Maven Central POM checker on fixtures and asserts it reports each missing element.'
+    def fixtures = layout.buildDirectory.dir('central-pom-fixtures')
+    doLast {
+        def base = fixtures.get().asFile
+        base.deleteDir()
+        base.mkdirs()
+
+        def elements = [
+                coordinates: '<groupId>io.approov</groupId><artifactId>service.android</artifactId><version>3.7.0</version>',
+                name: '<name>Approov Package for Android</name>',
+                description: '<description>Approov protection for Android apps</description>',
+                url: '<url>https://github.com/approov-alpha/approov-service-android</url>',
+                licenses: '<licenses><license><name>MIT License</name><url>https://opensource.org/licenses/MIT</url></license></licenses>',
+                developers: '<developers><developer><id>approov</id><name>Approov</name></developer></developers>',
+                scm: '<scm><connection>scm:git:git://github.com/approov-alpha/approov-service-android.git</connection>' +
+                        '<developerConnection>scm:git:ssh://github.com/approov-alpha/approov-service-android.git</developerConnection>' +
+                        '<url>https://github.com/approov-alpha/approov-service-android</url></scm>',
+        ]
+        def scenario = { String name, Map<String, String> overrides, String expected ->
+            def pom = new File(base, "${name}.xml")
+            pom.setText('<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>' +
+                    (elements + overrides).values().join('') + '</project>', 'UTF-8')
+            def errors = ApproovCentralPom.check(pom)
+            if (expected == null) {
+                assert errors.isEmpty(): "${name}: expected no errors, got ${errors}"
+            } else {
+                assert errors.any { it.contains(expected) }: "${name}: expected an error containing '${expected}', got ${errors}"
+            }
+        }
+
+        scenario('complete', [:], null)
+        scenario('no-name', [name: ''], 'POM has no name')
+        scenario('blank-name', [name: '<name> </name>'], 'POM has no name')
+        scenario('no-description', [description: ''], 'POM has no description')
+        scenario('no-url', [url: ''], 'POM has no url')
+        scenario('no-licenses', [licenses: ''], 'POM has no licenses')
+        scenario('license-no-url', [licenses: '<licenses><license><name>MIT License</name></license></licenses>'],
+                'license without a name or url')
+        scenario('no-developers', [developers: ''], 'POM has no developers')
+        scenario('developer-empty', [developers: '<developers><developer><email>a@b.c</email></developer></developers>'],
+                'developer without a name or id')
+        scenario('no-scm', [scm: ''], 'POM has no scm')
+        scenario('scm-no-connection', [scm: elements.scm.replaceFirst('<connection>[^<]*</connection>', '')],
+                'POM scm has no connection')
+        scenario('scm-no-developer-connection',
+                [scm: elements.scm.replaceFirst('<developerConnection>[^<]*</developerConnection>', '')],
+                'POM scm has no developerConnection')
+        scenario('scm-no-url', [scm: elements.scm.replaceFirst('<url>[^<]*</url>', '')], 'POM scm has no url')
+        scenario('snapshot', [coordinates: elements.coordinates.replace('3.7.0', '3.7.0-SNAPSHOT')], 'is a SNAPSHOT')
+        assert ApproovCentralPom.check(new File(base, 'absent.xml')).any { it.contains('POM not found') }:
+                'a missing POM is not reported'
+    }
+}

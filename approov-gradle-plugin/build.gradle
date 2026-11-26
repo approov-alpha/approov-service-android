@@ -1,0 +1,183 @@
+plugins {
+    id 'java-gradle-plugin'
+    id 'jacoco'
+    id 'maven-publish'
+}
+
+group = 'io.approov'
+// one version for the plugin and the library: they are released together and the
+// plugin fails the build when an app resolves a different library version
+version = project.findProperty('approovServiceVersion') ?: '0.0.0-dev'
+
+// the plugin reads its own version from the jar manifest to compare with the library
+tasks.named('jar') {
+    manifest {
+        attributes 'Implementation-Version': project.version.toString()
+    }
+}
+
+// repositories are declared in settings.gradle via dependencyResolutionManagement
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+    // Maven Central requires a sources and a javadoc jar beside the plugin jar
+    withSourcesJar()
+    withJavadocJar()
+}
+
+// the javadoc jar documents the public classes; the Gradle task getters and the like carry no comments
+tasks.named('javadoc') {
+    options.addStringOption('Xdoclint:all,-missing', '-quiet')
+}
+
+dependencies {
+    // AGP's variant/instrumentation API, provided by the consuming build's AGP at
+    // runtime, so it (and its bundled ASM) must not be bundled into this plugin.
+    // Compiled against the lowest supported AGP (8.6, React Native 0.76) so that a
+    // newer-only API fails here; functionalTest runs the plugin on an AGP matrix.
+    compileOnly 'com.android.tools.build:gradle-api:8.6.0'
+    // ASM is used to rewrite bytecode; keep it compileOnly so we bind to the same
+    // ASM classes AGP hands us at runtime (avoids ClassVisitor identity clashes)
+    compileOnly 'org.ow2.asm:asm:9.7'
+    // kotlin.Unit is needed to satisfy AGP's Kotlin function-typed callbacks from
+    // Java; present in the Gradle runtime
+    compileOnly 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'
+
+    // the weaving logic is unit tested directly against ASM (no AGP build / Android
+    // SDK required). ASM is needed to drive the transform; gradle-api is needed on
+    // the test classpath only so the JVM can link ApproovClassVisitorFactory, whose
+    // superinterface (AsmClassVisitorFactory) lives there.
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation gradleTestKit()
+    testImplementation 'org.ow2.asm:asm:9.7'
+    // the Cronet weave is checked on react-native-nitro-fetch's real compiled
+    // classes, re-read as a tree and run through ASM's bytecode analyzer
+    testImplementation 'org.ow2.asm:asm-tree:9.7'
+    testImplementation 'org.ow2.asm:asm-analysis:9.7'
+    // the unit tests only need to link the plugin's classes, against any AGP 8 API
+    testImplementation 'com.android.tools.build:gradle-api:8.9.0'
+    testImplementation 'org.mockito:mockito-core:5.11.0'
+    testRuntimeOnly 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'
+}
+
+test {
+    useJUnit()
+    systemProperty 'approovPluginProjectDir', projectDir.absolutePath
+    finalizedBy jacocoTestReport
+}
+
+// Functional test (opt-in, not part of check): builds a minimal Android app whose
+// library module stands in for react-native-nitro-fetch, applying the plugin on each
+// AGP:Gradle pair of -PagpMatrix (default 9.2.1:9.4.1), minified with resource
+// shrinking and the configuration cache. Needs an Android SDK; run with
+//   ./gradlew -p approov-gradle-plugin functionalTest -PagpMatrix=8.6.0:8.10.2,9.2.1:9.4.1
+sourceSets {
+    functionalTest
+}
+configurations {
+    functionalTestImplementation.extendsFrom testImplementation
+}
+dependencies {
+    functionalTestImplementation gradleTestKit()
+}
+tasks.register('functionalTest', Test) {
+    description = 'Builds a minified, resource-shrunk app with the plugin on each AGP of -PagpMatrix'
+    group = 'verification'
+    testClassesDirs = sourceSets.functionalTest.output.classesDirs
+    classpath = sourceSets.functionalTest.runtimeClasspath
+    useJUnit()
+    systemProperty 'approov.agpMatrix', providers.gradleProperty('agpMatrix').getOrElse('9.2.1:9.4.1')
+    systemProperty 'approov.pluginDir', projectDir.absolutePath
+    systemProperty 'approov.functionalDir', layout.buildDirectory.dir('functionalTest').get().asFile.absolutePath
+    outputs.upToDateWhen { false }
+    testLogging {
+        events 'passed', 'failed'
+        exceptionFormat = 'full'
+    }
+}
+
+jacoco {
+    toolVersion = '0.8.12'
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+}
+
+jacocoTestCoverageVerification {
+    dependsOn test
+    violationRules {
+        rule {
+            limit {
+                counter = 'LINE'
+                value = 'COVEREDRATIO'
+                minimum = 0.95
+            }
+            limit {
+                counter = 'BRANCH'
+                value = 'COVEREDRATIO'
+                minimum = 0.90
+            }
+        }
+    }
+}
+
+// Published to Maven Central (no Gradle Plugin Portal) as io.approov:service.android-gradle-plugin.
+// java-gradle-plugin + maven-publish also publish the plugin marker
+// io.approov.gradle:io.approov.gradle.gradle.plugin, which lets
+// plugins { id 'io.approov.gradle' } resolve from mavenCentral() in pluginManagement.
+publishing {
+    publications {
+        pluginMaven(MavenPublication) {
+            artifactId = 'service.android-gradle-plugin'
+            pom {
+                name = 'Approov Gradle plugin for Android'
+                description = 'Weaves Approov protection into OkHttp, HttpsURLConnection, Volley and Cronet at build time'
+            }
+        }
+    }
+}
+
+// the URL, licence, developers and scm of the POM that Maven Central requires, for the plugin and its marker
+// (whose name and description come from gradlePlugin below), and the centralBundle repository of
+// .maven/build-bundle.sh
+apply from: file('../gradle/publication-pom.gradle')
+
+tasks.register('verifyPluginPublication') {
+    group = 'verification'
+    description = 'Checks the plugin artifact coordinates and the plugin marker publication.'
+    dependsOn 'generatePomFileForPluginMavenPublication', 'generatePomFileForApproovPluginMarkerMavenPublication'
+    def pluginPom = layout.buildDirectory.file('publications/pluginMaven/pom-default.xml')
+    def markerPom = layout.buildDirectory.file('publications/approovPluginMarkerMaven/pom-default.xml')
+    def expectedVersion = provider { project.version.toString() }
+    doLast {
+        def plugin = new groovy.xml.XmlSlurper().parse(pluginPom.get().asFile)
+        assert plugin.groupId.text() == 'io.approov': "plugin groupId is ${plugin.groupId.text()}"
+        assert plugin.artifactId.text() == 'service.android-gradle-plugin': "plugin artifactId is ${plugin.artifactId.text()}"
+        assert plugin.version.text() == expectedVersion.get(): "plugin version is ${plugin.version.text()}"
+        def marker = new groovy.xml.XmlSlurper().parse(markerPom.get().asFile)
+        assert marker.groupId.text() == 'io.approov.gradle': "marker groupId is ${marker.groupId.text()}"
+        assert marker.artifactId.text() == 'io.approov.gradle.gradle.plugin': "marker artifactId is ${marker.artifactId.text()}"
+        assert marker.version.text() == expectedVersion.get(): "marker version is ${marker.version.text()}"
+        def target = marker.dependencies.dependency
+        assert target.groupId.text() == 'io.approov' && target.artifactId.text() == 'service.android-gradle-plugin' &&
+                target.version.text() == expectedVersion.get(): 'marker does not point at the plugin artifact'
+    }
+}
+
+gradlePlugin {
+    plugins {
+        approov {
+            id = 'io.approov.gradle'
+            implementationClass = 'io.approov.gradle.ApproovGradlePlugin'
+            displayName = 'Approov automatic networking protection'
+            description = 'Weaves Approov protection into OkHttp, HttpsURLConnection, Volley and Cronet at build time'
+        }
+    }
+}

@@ -1,0 +1,16 @@
+Approov Package for Android
+Copyright (c) 2016-present, Approov Ltd.
+
+This package is licensed under the MIT License. See LICENSE.
+
+This package uses the Approov SDK (io.approov:approov-android-sdk). The Approov SDK is not part of this package and is not covered by the MIT License. It is proprietary software of Approov Ltd, and you can use it only under the Approov terms (https://approov.io/terms) or your written agreement with Approov.
+
+This package contains code from other projects, under their own licenses:
+- approov-service/src/main/java/io/approov/util/universal/http/sfv: Apache License 2.0 (see the LICENSE file in that directory)
+- approov-service/src/main/java/io/approov/util/universal/sig: MIT License (see the LICENSE file in that directory)
+
+The release AAR bundles these libraries, relocated under io.approov.util.universal, each under the Apache License 2.0 (see LICENSE-APACHE-2.0):
+- Tink for Android 1.23.0 (com.google.crypto.tink:tink-android), https://github.com/tink-crypto/tink-java
+- Gson 2.13.2 (com.google.code.gson:gson), https://github.com/google/gson
+- Error Prone annotations 2.41.0 (com.google.errorprone:error_prone_annotations), https://github.com/google/error-prone
+- JSR 305 annotations 3.0.2 (com.google.code.findbugs:jsr305)

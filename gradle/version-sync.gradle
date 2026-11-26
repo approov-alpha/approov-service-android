@@ -1,0 +1,291 @@
+// Version and documentation sync check (applied from the root build.gradle).
+//
+// The release version lives in one place, releaseVersion in gradle.properties. The
+// library and the Gradle plugin are published with -PapproovServiceVersion set to it
+// (the property defaults to 0.0.0-dev for local and test builds). verifyVersionSync
+// fails the build when anything that names a version disagrees with releaseVersion:
+// the top CHANGELOG heading, the dependency and plugin snippets of README.md and
+// approov-gradle-plugin/README.md, the Approov SDK badge against the SDK dependency,
+// and an explicitly requested approovServiceVersion. It also fails when README.md or
+// ADVANCED.md names another OkHttp than okhttpVersion in gradle.properties as the one
+// the package brings. It also rejects the em dash in
+// the customer-facing documents. verifyVersionSyncSelfTest runs the same checker on
+// fixtures, so a checker that stops detecting a mismatch fails the build too.
+//
+// verifyReleaseSdk, which every publish task of the library depends on, fails a release from 3.7.0 on
+// (-PapproovServiceVersion=3.7.x or later) whose Approov SDK dependency is 3.5.x.
+
+class ApproovVersionSync {
+    static final String EM_DASH = '—'
+    static final List<String> CUSTOMER_DOCS = ['README.md', 'ADVANCED.md', 'REFERENCE.md', 'CHANGELOG.md',
+                                               'SECURITY.md', 'approov-gradle-plugin/README.md']
+
+    // every place a document names the library or plugin version: Gradle Groovy and
+    // Kotlin DSL coordinates, and the plugins {} id form
+    static final List<java.util.regex.Pattern> LIBRARY_PATTERNS = [
+            ~/io\.approov:service\.android:([^'"\s)]+)/,
+    ]
+    static final List<java.util.regex.Pattern> PLUGIN_PATTERNS = [
+            ~/io\.approov:service\.android-gradle-plugin:([^'"\s)]+)/,
+            ~/id\s*\(?\s*['"]io\.approov\.gradle['"]\s*\)?\s+version\s+['"]([^'"]+)['"]/,
+    ]
+
+    // where a document names the OkHttp the library declares
+    static final java.util.regex.Pattern OKHTTP_PATTERN = ~/brings OkHttp (\d+\.\d+\.\d+)/
+
+    /**
+     * Checks the repository at root and returns one message per disagreement; an
+     * empty list means everything names releaseVersion.
+     */
+    static List<String> check(File root, String releaseVersion, String requestedVersion) {
+        def errors = []
+        if (releaseVersion == null || !(releaseVersion ==~ /\d+\.\d+\.\d+/)) {
+            errors << "gradle.properties releaseVersion must be X.Y.Z, found '${releaseVersion}'"
+            return errors
+        }
+
+        def changelog = new File(root, 'CHANGELOG.md')
+        if (!changelog.isFile()) {
+            errors << 'CHANGELOG.md is missing'
+        } else {
+            def heading = changelog.readLines('UTF-8').find { it.startsWith('## ') }
+            def m = heading == null ? null : (heading =~ /^## \[(\d+\.\d+\.\d+)\]( - .+)?$/)
+            if (m == null || !m.matches())
+                errors << "CHANGELOG.md top heading must be '## [${releaseVersion}] - <date or Unreleased>', found '${heading}'"
+            else if (m.group(1) != releaseVersion)
+                errors << "CHANGELOG.md top version ${m.group(1)} is not releaseVersion ${releaseVersion}"
+        }
+
+        checkSnippets(root, 'README.md', releaseVersion, errors)
+        checkSnippets(root, 'approov-gradle-plugin/README.md', releaseVersion, errors)
+
+        // the SDK badge of the README names the SDK the library depends on
+        def readme = new File(root, 'README.md')
+        def serviceBuild = new File(root, 'approov-service/build.gradle')
+        if (readme.isFile() && serviceBuild.isFile()) {
+            def sdk = (serviceBuild.getText('UTF-8') =~ /io\.approov:approov-android-sdk:([^'"\s]+)/)
+            def badge = (readme.getText('UTF-8') =~ /badge\/Approov%20SDK-([^-?]+)-/)
+            if (!sdk.find())
+                errors << 'approov-service/build.gradle declares no io.approov:approov-android-sdk dependency'
+            else if (!badge.find())
+                errors << 'README.md has no Approov SDK badge'
+            else if (badge.group(1) != sdk.group(1))
+                errors << "README.md Approov SDK badge ${badge.group(1)} is not the SDK dependency ${sdk.group(1)}"
+        }
+
+        // README.md and ADVANCED.md name the OkHttp the library declares, okhttpVersion in gradle.properties
+        def properties = new Properties()
+        def propertiesFile = new File(root, 'gradle.properties')
+        if (propertiesFile.isFile())
+            propertiesFile.withInputStream { properties.load(it) }
+        def okhttpVersion = properties.getProperty('okhttpVersion')
+        if ((okhttpVersion == null) || !(okhttpVersion ==~ /\d+\.\d+\.\d+/)) {
+            errors << "gradle.properties okhttpVersion must be X.Y.Z, found '${okhttpVersion}'"
+        } else {
+            ['README.md', 'ADVANCED.md'].each { name ->
+                def doc = new File(root, name)
+                int found = 0
+                if (doc.isFile()) {
+                    def m = doc.getText('UTF-8') =~ OKHTTP_PATTERN
+                    while (m.find()) {
+                        found++
+                        if (m.group(1) != okhttpVersion)
+                            errors << "${name} says the package brings OkHttp ${m.group(1)}, not okhttpVersion ${okhttpVersion}"
+                    }
+                }
+                if ((found == 0) && (name == 'README.md'))
+                    errors << 'README.md does not say which OkHttp the package brings'
+            }
+        }
+
+        // a release passes -PapproovServiceVersion; development builds leave it unset
+        // or use a -dev or -SNAPSHOT version
+        if (requestedVersion != null && requestedVersion != releaseVersion &&
+                !requestedVersion.endsWith('-dev') && !requestedVersion.endsWith('-SNAPSHOT'))
+            errors << "-PapproovServiceVersion=${requestedVersion} is not releaseVersion ${releaseVersion}"
+
+        CUSTOMER_DOCS.each { name ->
+            def doc = new File(root, name)
+            if (doc.isFile()) {
+                doc.readLines('UTF-8').eachWithIndex { line, i ->
+                    if (line.contains(EM_DASH))
+                        errors << "${name}:${i + 1} contains an em dash"
+                }
+            }
+        }
+        return errors
+    }
+
+    /**
+     * Checks that a release of the library may be published with the Approov SDK it depends on: a release
+     * from 3.7.0 on needs the 3.7 SDK, so a 3.5.x SDK dependency fails it. A development build (no
+     * approovServiceVersion, or one ending -dev or -SNAPSHOT) passes whatever the SDK. Returns one message
+     * per problem; an empty list means the publish may go ahead.
+     */
+    static List<String> checkReleaseSdk(File root, String publishedVersion) {
+        def errors = []
+        def release = (publishedVersion == null) ? null : (publishedVersion =~ /^(\d+)\.(\d+)\.\d+$/)
+        if ((release == null) || !release.matches())
+            return errors
+
+        // only a release from 3.7.0 on needs the newer SDK
+        int major = release.group(1) as int
+        int minor = release.group(2) as int
+        if ((major < 3) || ((major == 3) && (minor < 7)))
+            return errors
+        def serviceBuild = new File(root, 'approov-service/build.gradle')
+        def sdk = serviceBuild.isFile()
+                ? (serviceBuild.getText('UTF-8') =~ /io\.approov:approov-android-sdk:([^'"\s]+)/) : null
+        if ((sdk == null) || !sdk.find())
+            errors << 'approov-service/build.gradle declares no io.approov:approov-android-sdk dependency'
+        else if (sdk.group(1).startsWith('3.5.'))
+            errors << "a ${publishedVersion} release cannot depend on the ${sdk.group(1)} Approov SDK: " +
+                    'move io.approov:approov-android-sdk to 3.7 first'
+        return errors
+    }
+
+    private static void checkSnippets(File root, String name, String releaseVersion, List<String> errors) {
+        def doc = new File(root, name)
+        if (!doc.isFile()) {
+            errors << "${name} is missing"
+            return
+        }
+        def text = doc.getText('UTF-8')
+        [library: LIBRARY_PATTERNS, plugin: PLUGIN_PATTERNS].each { kind, patterns ->
+            int found = 0
+            patterns.each { pattern ->
+                def m = text =~ pattern
+                while (m.find()) {
+                    found++
+                    if (m.group(1) != releaseVersion)
+                        errors << "${name} names ${kind} version ${m.group(1)}, not releaseVersion ${releaseVersion}: ${m.group(0)}"
+                }
+            }
+            if (found == 0)
+                errors << "${name} has no ${kind} dependency snippet naming the version"
+        }
+    }
+}
+
+def releaseVersionValue = providers.gradleProperty('releaseVersion').getOrNull()
+def requestedVersionValue = providers.gradleProperty('approovServiceVersion').getOrNull()
+def repositoryRoot = rootProject.projectDir
+
+tasks.register('verifyVersionSync') {
+    group = 'verification'
+    description = 'Fails when the CHANGELOG, README snippets, plugin README or requested version disagree with releaseVersion.'
+    def root = repositoryRoot
+    def release = releaseVersionValue
+    def requested = requestedVersionValue
+    // no outputs, so it runs on every build: the documents it reads change by hand
+    doLast {
+        def errors = ApproovVersionSync.check(root, release, requested)
+        if (!errors.isEmpty())
+            throw new GradleException("Version or documentation out of sync:\n  " + errors.join('\n  '))
+    }
+}
+
+// part of every publish of the library (see approov-service/build.gradle), never of the test gates
+tasks.register('verifyReleaseSdk') {
+    group = 'verification'
+    description = 'Fails a release from 3.7.0 on (-PapproovServiceVersion) whose Approov SDK dependency is 3.5.x.'
+    def root = repositoryRoot
+    def requested = requestedVersionValue
+    doLast {
+        def errors = ApproovVersionSync.checkReleaseSdk(root, requested)
+        if (!errors.isEmpty())
+            throw new GradleException("Release blocked:\n  " + errors.join('\n  '))
+    }
+}
+
+tasks.register('verifyVersionSyncSelfTest') {
+    group = 'verification'
+    description = 'Runs the version sync checker on fixtures and asserts it reports each mismatch.'
+    def fixtures = layout.buildDirectory.dir('version-sync-fixtures')
+    doLast {
+        def base = fixtures.get().asFile
+        base.deleteDir()
+
+        def write = { File dir, Map<String, String> files ->
+            files.each { name, text ->
+                def f = new File(dir, name)
+                f.parentFile.mkdirs()
+                f.setText(text, 'UTF-8')
+            }
+            dir
+        }
+        def good = [
+                'CHANGELOG.md': '# Changelog\n\n## [3.7.0] - Unreleased\n\n### Added\n',
+                'README.md': "![SDK](https://img.shields.io/badge/Approov%20SDK-3.5.3-blue)\n" +
+                        "implementation(\"io.approov:service.android:3.7.0\")\n" +
+                        "id 'io.approov.gradle' version '3.7.0'\n" +
+                        "classpath 'io.approov:service.android-gradle-plugin:3.7.0'\n" +
+                        "The package brings OkHttp 4.12.0.\n",
+                'gradle.properties': 'releaseVersion=3.7.0\nokhttpVersion=4.12.0\n',
+                'approov-gradle-plugin/README.md': "implementation 'io.approov:service.android:3.7.0'\n" +
+                        "id(\"io.approov.gradle\") version \"3.7.0\"\n",
+                'approov-service/build.gradle': "implementation 'io.approov:approov-android-sdk:3.5.3'\n",
+        ]
+        def scenario = { String name, Map<String, String> overrides, String release, String requested, String expected ->
+            def dir = write(new File(base, name), good + overrides)
+            def errors = ApproovVersionSync.check(dir, release, requested)
+            if (expected == null) {
+                assert errors.isEmpty(): "${name}: expected no errors, got ${errors}"
+            } else {
+                assert errors.any { it.contains(expected) }: "${name}: expected an error containing '${expected}', got ${errors}"
+            }
+        }
+
+        scenario('in-sync', [:], '3.7.0', null, null)
+        scenario('dev-build', [:], '3.7.0', '0.0.0-dev', null)
+        scenario('release-build', [:], '3.7.0', '3.7.0', null)
+        scenario('released-heading', ['CHANGELOG.md': '## [3.7.0] - 2026-10-20\n'], '3.7.0', null, null)
+        scenario('no-release-version', [:], null, null, 'releaseVersion must be X.Y.Z')
+        scenario('changelog-older', ['CHANGELOG.md': '## [3.6.9] - 2026-01-01\n'], '3.7.0', null, 'CHANGELOG.md top version 3.6.9')
+        scenario('changelog-unversioned', ['CHANGELOG.md': '## Unreleased\n'], '3.7.0', null, 'CHANGELOG.md top heading must be')
+        scenario('readme-library', ['README.md': good['README.md'].replace('service.android:3.7.0', 'service.android:3.6.0')],
+                '3.7.0', null, 'README.md names library version 3.6.0')
+        scenario('readme-placeholder', ['README.md': good['README.md'].replace('service.android:3.7.0', 'service.android:<version>')],
+                '3.7.0', null, 'README.md names library version <version>')
+        scenario('readme-plugin-id', ['README.md': good['README.md'].replace("version '3.7.0'", "version '3.7.1'")],
+                '3.7.0', null, 'README.md names plugin version 3.7.1')
+        scenario('plugin-readme-classpath', ['approov-gradle-plugin/README.md': good['approov-gradle-plugin/README.md'] +
+                "classpath 'io.approov:service.android-gradle-plugin:3.9.0'\n"], '3.7.0', null,
+                'approov-gradle-plugin/README.md names plugin version 3.9.0')
+        scenario('plugin-readme-no-snippet', ['approov-gradle-plugin/README.md': 'no snippets\n'], '3.7.0', null,
+                'approov-gradle-plugin/README.md has no library dependency snippet')
+        scenario('sdk-badge', ['approov-service/build.gradle': "implementation 'io.approov:approov-android-sdk:3.7.0'\n"],
+                '3.7.0', null, 'Approov SDK badge 3.5.3 is not the SDK dependency 3.7.0')
+        scenario('requested-mismatch', [:], '3.7.0', '3.7.1', '-PapproovServiceVersion=3.7.1')
+        scenario('em-dash', ['ADVANCED.md': "a — b\n"], '3.7.0', null, 'ADVANCED.md:1 contains an em dash')
+        scenario('readme-okhttp', ['README.md': good['README.md'].replace('brings OkHttp 4.12.0', 'brings OkHttp 4.11.0')],
+                '3.7.0', null, 'README.md says the package brings OkHttp 4.11.0, not okhttpVersion 4.12.0')
+        scenario('readme-no-okhttp', ['README.md': good['README.md'].replace('brings OkHttp 4.12.0', '')],
+                '3.7.0', null, 'README.md does not say which OkHttp the package brings')
+        scenario('advanced-okhttp', ['ADVANCED.md': 'The package brings OkHttp 5.5.0.\n'],
+                '3.7.0', null, 'ADVANCED.md says the package brings OkHttp 5.5.0, not okhttpVersion 4.12.0')
+        scenario('no-okhttp-version', ['gradle.properties': 'releaseVersion=3.7.0\n'],
+                '3.7.0', null, 'gradle.properties okhttpVersion must be X.Y.Z')
+
+        // the release SDK check: no release from 3.7.0 on is made on a 3.5.x SDK
+        def sdkScenario = { String name, String sdk, String published, String expected ->
+            def dir = write(new File(base, name), good + ['approov-service/build.gradle': (sdk == null)
+                    ? 'dependencies {}\n' : "implementation 'io.approov:approov-android-sdk:${sdk}'\n"])
+            def errors = ApproovVersionSync.checkReleaseSdk(dir, published)
+            if (expected == null) {
+                assert errors.isEmpty(): "${name}: expected no errors, got ${errors}"
+            } else {
+                assert errors.any { it.contains(expected) }: "${name}: expected an error containing '${expected}', got ${errors}"
+            }
+        }
+        sdkScenario('sdk-release-on-3.5', '3.5.3', '3.7.0', 'a 3.7.0 release cannot depend on the 3.5.3 Approov SDK')
+        sdkScenario('sdk-patch-release-on-3.5', '3.5.0', '3.7.2', 'a 3.7.2 release cannot depend on the 3.5.0 Approov SDK')
+        sdkScenario('sdk-later-release-on-3.5', '3.5.3', '10.0.0', 'a 10.0.0 release cannot depend on the 3.5.3 Approov SDK')
+        sdkScenario('sdk-older-release-on-3.5', '3.5.3', '3.6.9', null)
+        sdkScenario('sdk-release-on-3.7', '3.7.0', '3.7.0', null)
+        sdkScenario('sdk-dev-build-on-3.5', '3.5.3', '0.0.0-dev', null)
+        sdkScenario('sdk-unset-version-on-3.5', '3.5.3', null, null)
+        sdkScenario('sdk-snapshot-on-3.5', '3.5.3', '3.7.0-SNAPSHOT', null)
+        sdkScenario('sdk-missing', null, '3.7.0', 'declares no io.approov:approov-android-sdk dependency')
+    }
+}

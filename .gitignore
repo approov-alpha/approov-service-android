@@ -1,0 +1,41 @@
+# Gradle
+.gradle/
+build/
+*/build/
+
+# Local configuration (contains machine-specific SDK path)
+local.properties
+
+# Approov account config and development key (secrets): never commit; see
+# approov.properties.example for the expected keys
+approov.properties
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# OS
+.DS_Store
+
+# signing keys, local secrets and logs never belong in the repository
+*.jks
+*.keystore
+.dev.vars
+*.log
+
+# Android
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# local editor/tooling state
+
+# Included plugin build output
+approov-gradle-plugin/.gradle/
+approov-gradle-plugin/build/
+graphify-out/

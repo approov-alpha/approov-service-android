@@ -1,0 +1,10 @@
+pluginManagement {
+    includeBuild 'approov-gradle-plugin'
+    repositories {
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+}
+
+include ':approov-service'
